@@ -1,13 +1,18 @@
 name: CI Pipeline
 
+# Runs on every push to main AND whenever a Pull Request targets main
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
 
+env:
+  IMAGE_NAME: flaskapp
+
 jobs:
-  build:
+  # ---------- Job 1: unit tests (runs in parallel with job 2) ----------
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -24,8 +29,76 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run tests
-        run: |
-          pytest
+        run: pytest -v
+
+      # Only runs if a previous step in this job failed
+      - name: Send email notification on failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "❌ Tests failed in ${{ github.repository }}"
+          to: ${{ secrets.MAIL_USERNAME }}
+          from: GitHub Actions <${{ secrets.MAIL_USERNAME }}>
+          body: |
+            Tests failed on branch ${{ github.ref_name }} (commit ${{ github.sha }}).
+            See the run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # ---------- Job 2: Docker build (runs in parallel with job 1) ----------
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t flaskapp:${{ github.sha }} .
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+  # ---------- Job 3: push to registries ----------
+  # needs: waits for BOTH jobs; if tests fail, this job is skipped.
+  # Only on push to main (not on PRs, which shouldn't publish images).
+  push:
+    needs: [ test, docker-build ]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # needed to push to GitHub Container Registry
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # GHCR requires lowercase image names
+      - name: Prepare lowercase owner name
+        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      # Registry 1: Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Registry 2: GitHub Container Registry (ghcr.io)
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # One build, pushed to both registries
+      - name: Build and push to both registries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
